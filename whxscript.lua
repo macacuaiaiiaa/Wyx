@@ -95,40 +95,112 @@ function ChessEngine.getBestMove(fen)
     end
     
     return Utils.safeCall(function()
-        local requestBody = HttpService:JSONEncode({
-            fen = fen,
-            depth = CONFIG.STOCKFISH_DEPTH
-        })
+        -- Tentativa 1: Usar proxy CORS para contornar limitações do Roblox
+        local proxyUrl = "https://api.allorigins.win/raw?url=" .. HttpService:UrlEncode(CONFIG.STOCKFISH_API_URL)
         
-        local response = HttpService:PostAsync(
-            CONFIG.STOCKFISH_API_URL, 
-            requestBody, 
-            Enum.HttpContentType.ApplicationJson,
-            false,
-            {["Content-Type"] = "application/json"}
-        )
+        -- Tentar primeiro com proxy CORS
+        local success1, response1 = pcall(function()
+            local requestBody = HttpService:JSONEncode({
+                fen = fen,
+                depth = CONFIG.STOCKFISH_DEPTH
+            })
+            
+            return HttpService:PostAsync(
+                proxyUrl,
+                requestBody,
+                Enum.HttpContentType.ApplicationJson,
+                false,
+                {
+                    ["Content-Type"] = "application/json",
+                    ["Access-Control-Allow-Origin"] = "*"
+                }
+            )
+        end)
         
-        local data = HttpService:JSONDecode(response)
-        
-        if not data or not data.bestmove or #data.bestmove < 4 then
-            error("Resposta inválida da API")
+        if success1 then
+            local data = HttpService:JSONDecode(response1)
+            if data and data.bestmove and #data.bestmove >= 4 then
+                local move = data.bestmove
+                local fromSquare = move:sub(1, 2)
+                local toSquare = move:sub(3, 4)
+                
+                if fromSquare:match("^[a-h][1-8]$") and toSquare:match("^[a-h][1-8]$") then
+                    return {
+                        from = fromSquare,
+                        to = toSquare,
+                        move = move,
+                        evaluation = data.evaluation or 0
+                    }
+                end
+            end
         end
         
-        local move = data.bestmove
-        local fromSquare = move:sub(1, 2)
-        local toSquare = move:sub(3, 4)
+        -- Tentativa 2: Usar método GET com parâmetros na URL
+        local success2, response2 = pcall(function()
+            local getUrl = CONFIG.STOCKFISH_API_URL .. "?fen=" .. HttpService:UrlEncode(fen) .. "&depth=" .. CONFIG.STOCKFISH_DEPTH
+            return HttpService:GetAsync(getUrl, false, {
+                ["Accept"] = "application/json",
+                ["User-Agent"] = "RobloxStudio"
+            })
+        end)
         
-        -- Validar formato das casas
-        if not fromSquare:match("^[a-h][1-8]$") or not toSquare:match("^[a-h][1-8]$") then
-            error("Formato de movimento inválido: " .. move)
+        if success2 then
+            local data = HttpService:JSONDecode(response2)
+            if data and data.bestmove and #data.bestmove >= 4 then
+                local move = data.bestmove
+                local fromSquare = move:sub(1, 2)
+                local toSquare = move:sub(3, 4)
+                
+                if fromSquare:match("^[a-h][1-8]$") and toSquare:match("^[a-h][1-8]$") then
+                    return {
+                        from = fromSquare,
+                        to = toSquare,
+                        move = move,
+                        evaluation = data.evaluation or 0
+                    }
+                end
+            end
         end
         
-        return {
-            from = fromSquare,
-            to = toSquare,
-            move = move,
-            evaluation = data.evaluation or 0
-        }
+        -- Tentativa 3: Usar proxy alternativo
+        local altProxyUrl = "https://cors-anywhere.herokuapp.com/" .. CONFIG.STOCKFISH_API_URL
+        local success3, response3 = pcall(function()
+            local requestBody = HttpService:JSONEncode({
+                fen = fen,
+                depth = CONFIG.STOCKFISH_DEPTH
+            })
+            
+            return HttpService:PostAsync(
+                altProxyUrl,
+                requestBody,
+                Enum.HttpContentType.ApplicationJson,
+                false,
+                {
+                    ["Content-Type"] = "application/json",
+                    ["X-Requested-With"] = "XMLHttpRequest"
+                }
+            )
+        end)
+        
+        if success3 then
+            local data = HttpService:JSONDecode(response3)
+            if data and data.bestmove and #data.bestmove >= 4 then
+                local move = data.bestmove
+                local fromSquare = move:sub(1, 2)
+                local toSquare = move:sub(3, 4)
+                
+                if fromSquare:match("^[a-h][1-8]$") and toSquare:match("^[a-h][1-8]$") then
+                    return {
+                        from = fromSquare,
+                        to = toSquare,
+                        move = move,
+                        evaluation = data.evaluation or 0
+                    }
+                end
+            end
+        end
+        
+        error("Todas as tentativas de requisição falharam")
     end, "Erro na API Stockfish")
 end
 
