@@ -1,375 +1,522 @@
+--[[
+    WHXScript - Auto Chess Engine
+    Versão melhorada com melhor organização e performance
+    Autor: WHX
+]]
+
+-- ===== SERVIÇOS E CONFIGURAÇÕES =====
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
 
+-- Configurações principais
+local CONFIG = {
+    STOCKFISH_API_URL = "https://v0-gpt-5-development-eight.vercel.app/api/move",
+    STOCKFISH_DEPTH = 12,
+    UPDATE_INTERVAL = 0.5, -- segundos entre verificações
+    ARROW_COLORS = {
+        NORMAL = Color3.fromRGB(150, 0, 0),
+        HOVER = Color3.fromRGB(200, 50, 50),
+        ACTIVE = Color3.fromRGB(255, 100, 100)
+    },
+    GUI_COLORS = {
+        BACKGROUND = Color3.fromRGB(25, 0, 30),
+        ACCENT = Color3.fromRGB(160, 32, 240),
+        SUCCESS = Color3.fromRGB(0, 255, 0),
+        ERROR = Color3.fromRGB(255, 40, 40),
+        TEXT = Color3.fromRGB(255, 255, 255)
+    }
+}
+
+-- ===== VARIÁVEIS GLOBAIS =====
 local player = Players.LocalPlayer
 local playerGui = player:WaitForChild("PlayerGui")
 
-local sunfishEnabled = false
-local checkingMove = false
-local lastFEN = nil
-local lastMove = nil
+-- Estado do script
+local ScriptState = {
+    enabled = false,
+    checking = false,
+    lastFEN = nil,
+    lastMove = nil,
+    lastUpdateTime = 0,
+    errorCount = 0,
+    maxErrors = 5
+}
 
-local STOCKFISH_API_URL = "https://v0-gpt-5-development-eight.vercel.app/api/move"
+-- ===== UTILITÁRIOS =====
+local Utils = {}
 
-local function getFEN()
-    local success, result = pcall(function()
-        local tableSet = ReplicatedStorage:WaitForChild("InternalClientEvents"):WaitForChild("GetActiveTableset")
-        local board = tableSet:Invoke()
-        return board:WaitForChild("FEN").Value
-    end)
-    if success and type(result) == "string" then
-        return result
-    else
+function Utils.clamp(value, min, max)
+    return math.max(min, math.min(max, value))
+end
+
+function Utils.lerp(a, b, t)
+    return a + (b - a) * t
+end
+
+function Utils.createTween(object, info, properties)
+    local tween = TweenService:Create(object, info, properties)
+    tween:Play()
+    return tween
+end
+
+function Utils.safeCall(func, errorMessage)
+    local success, result = pcall(func)
+    if not success then
+        warn("[WHXScript] " .. (errorMessage or "Erro desconhecido") .. ": " .. tostring(result))
+        ScriptState.errorCount = ScriptState.errorCount + 1
         return nil
     end
+    return result
 end
 
-local function getBestMoveStockfish(fen)
-    local success, response = pcall(function()
-        local body = HttpService:JSONEncode({
-            fen = fen,
-            depth = 12 -- ajustar se necessário para performance
-        })
-        local res = HttpService:PostAsync(STOCKFISH_API_URL, body, Enum.HttpContentType.ApplicationJson)
-        return HttpService:JSONDecode(res)
-    end)
+-- ===== MÓDULO DE XADREZ =====
+local ChessEngine = {}
 
-    if success and response and response.bestmove then
-        local move = response.bestmove
-        if #move >= 4 then
-            local from = move:sub(1, 2)
-            local to = move:sub(3, 4)
-            return from, to
+function ChessEngine.getFEN()
+    return Utils.safeCall(function()
+        local tableSet = ReplicatedStorage:WaitForChild("InternalClientEvents"):WaitForChild("GetActiveTableset")
+        local board = tableSet:Invoke()
+        local fen = board:WaitForChild("FEN").Value
+        
+        if type(fen) ~= "string" or #fen < 10 then
+            error("FEN inválido recebido")
         end
-    else
-        warn("[WHXScript] Erro na API Stockfish ou resposta inválida")
-    end
-
-    return nil
+        
+        return fen
+    end, "Erro ao obter FEN")
 end
 
-local board = playerGui:WaitForChild("2DBoard"):WaitForChild("GodFrame"):WaitForChild("Board")
+function ChessEngine.getBestMove(fen)
+    if not fen or #fen < 10 then
+        return nil
+    end
+    
+    return Utils.safeCall(function()
+        local requestBody = HttpService:JSONEncode({
+            fen = fen,
+            depth = CONFIG.STOCKFISH_DEPTH
+        })
+        
+        local response = HttpService:PostAsync(
+            CONFIG.STOCKFISH_API_URL, 
+            requestBody, 
+            Enum.HttpContentType.ApplicationJson,
+            false,
+            {["Content-Type"] = "application/json"}
+        )
+        
+        local data = HttpService:JSONDecode(response)
+        
+        if not data or not data.bestmove or #data.bestmove < 4 then
+            error("Resposta inválida da API")
+        end
+        
+        local move = data.bestmove
+        local fromSquare = move:sub(1, 2)
+        local toSquare = move:sub(3, 4)
+        
+        -- Validar formato das casas
+        if not fromSquare:match("^[a-h][1-8]$") or not toSquare:match("^[a-h][1-8]$") then
+            error("Formato de movimento inválido: " .. move)
+        end
+        
+        return {
+            from = fromSquare,
+            to = toSquare,
+            move = move,
+            evaluation = data.evaluation or 0
+        }
+    end, "Erro na API Stockfish")
+end
 
--- === Criar GUI da seta (linha via imagem + ponta) ===
-local arrowGui = playerGui:FindFirstChild("WHXScript_ArrowGui")
-if not arrowGui then
+-- ===== MÓDULO DE INTERFACE =====
+local GUI = {}
+
+function GUI.init()
+    GUI.createArrowSystem()
+    GUI.createMainWindow()
+    GUI.createMiniBar()
+    GUI.setupEventHandlers()
+end
+
+function GUI.createArrowSystem()
+    local arrowGui = playerGui:FindFirstChild("WHXScript_ArrowGui")
+    if arrowGui then arrowGui:Destroy() end
+    
     arrowGui = Instance.new("ScreenGui")
     arrowGui.Name = "WHXScript_ArrowGui"
     arrowGui.ResetOnSpawn = false
+    arrowGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     arrowGui.Parent = playerGui
-end
-
-local arrowLine = arrowGui:FindFirstChild("WHX_ArrowLine")
-if not arrowLine then
-    arrowLine = Instance.new("ImageLabel")
-    arrowLine.Name = "WHX_ArrowLine"
+    
+    -- Linha da seta
+    local arrowLine = Instance.new("ImageLabel")
+    arrowLine.Name = "ArrowLine"
     arrowLine.BackgroundTransparency = 1
-    arrowLine.Image = "rbxassetid://3926305904" -- linha fina e suave
-    arrowLine.Size = UDim2.new(0, 0, 0, 8) -- linha mais grossa
+    arrowLine.Image = "rbxassetid://3926305904"
+    arrowLine.Size = UDim2.new(0, 0, 0, 10)
     arrowLine.AnchorPoint = Vector2.new(0, 0.5)
-    arrowLine.ImageColor3 = Color3.fromRGB(150, 0, 0) -- vermelho sangue escuro
+    arrowLine.ImageColor3 = CONFIG.ARROW_COLORS.NORMAL
+    arrowLine.ZIndex = 10
+    arrowLine.Visible = false
     arrowLine.Parent = arrowGui
+    
+    -- Ponta da seta
+    local arrowPointer = Instance.new("ImageLabel")
+    arrowPointer.Name = "ArrowPointer"
+    arrowPointer.Image = "rbxassetid://3926307971"
+    arrowPointer.BackgroundTransparency = 1
+    arrowPointer.Size = UDim2.new(0, 30, 0, 30)
+    arrowPointer.AnchorPoint = Vector2.new(0.5, 0.5)
+    arrowPointer.ImageColor3 = CONFIG.ARROW_COLORS.NORMAL
+    arrowPointer.ZIndex = 11
+    arrowPointer.Visible = false
+    arrowPointer.Parent = arrowGui
+    
+    GUI.arrowLine = arrowLine
+    GUI.arrowPointer = arrowPointer
 end
 
-local pointer = arrowGui:FindFirstChild("WHX_ArrowPointer")
-if not pointer then
-    pointer = Instance.new("ImageLabel")
-    pointer.Name = "WHX_ArrowPointer"
-    pointer.Image = "rbxassetid://3926307971" -- seta limpa
-    pointer.BackgroundTransparency = 1
-    pointer.Size = UDim2.new(0, 28, 0, 28)
-    pointer.AnchorPoint = Vector2.new(0.5, 0.5)
-    pointer.ImageColor3 = Color3.fromRGB(150, 0, 0) -- vermelho sangue escuro
-    pointer.Parent = arrowGui
-end
-
-arrowLine.Visible = false
-pointer.Visible = false
-
-local function updateArrow(fromSquare, toSquare)
-    if not fromSquare or not toSquare then
-        arrowLine.Visible = false
-        pointer.Visible = false
+function GUI.updateArrow(moveData)
+    if not moveData or not GUI.arrowLine or not GUI.arrowPointer then
+        GUI.clearArrow()
         return
     end
-
-    local fromFrame = board:FindFirstChild(fromSquare:lower())
-    local toFrame = board:FindFirstChild(toSquare:lower())
+    
+    local board = playerGui:WaitForChild("2DBoard"):WaitForChild("GodFrame"):WaitForChild("Board")
+    local fromFrame = board:FindFirstChild(moveData.from:lower())
+    local toFrame = board:FindFirstChild(moveData.to:lower())
+    
     if not fromFrame or not toFrame then
-        arrowLine.Visible = false
-        pointer.Visible = false
+        GUI.clearArrow()
         return
     end
-
+    
     local fromPos = fromFrame.AbsolutePosition + fromFrame.AbsoluteSize / 2
     local toPos = toFrame.AbsolutePosition + toFrame.AbsoluteSize / 2
     local direction = toPos - fromPos
     local distance = direction.Magnitude
-
-    local lineLength = math.max(0, distance - 28) -- espaço para a ponta da seta
-
+    local lineLength = math.max(0, distance - 30)
     local angle = math.deg(math.atan2(direction.Y, direction.X))
-
-    arrowLine.Visible = true
-    pointer.Visible = true
-
-    arrowLine.Position = UDim2.new(0, fromPos.X, 0, fromPos.Y)
-    arrowLine.Size = UDim2.new(0, lineLength, 0, 8)
-    arrowLine.Rotation = angle
-    arrowLine.ImageColor3 = Color3.fromRGB(150, 0, 0)
-
-    pointer.Position = UDim2.new(0, toPos.X, 0, toPos.Y)
-    pointer.Rotation = angle
-    pointer.ImageColor3 = Color3.fromRGB(150, 0, 0)
+    
+    -- Animar aparição da seta
+    GUI.arrowLine.Visible = true
+    GUI.arrowPointer.Visible = true
+    
+    GUI.arrowLine.Position = UDim2.new(0, fromPos.X, 0, fromPos.Y)
+    GUI.arrowLine.Size = UDim2.new(0, lineLength, 0, 10)
+    GUI.arrowLine.Rotation = angle
+    
+    GUI.arrowPointer.Position = UDim2.new(0, toPos.X, 0, toPos.Y)
+    GUI.arrowPointer.Rotation = angle
+    
+    -- Efeito de pulsação
+    Utils.createTween(GUI.arrowLine, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+        ImageTransparency = 0.3
+    })
+    
+    Utils.createTween(GUI.arrowPointer, TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true), {
+        ImageTransparency = 0.3
+    })
 end
 
-local function clearArrow()
-    arrowLine.Visible = false
-    pointer.Visible = false
+function GUI.clearArrow()
+    if GUI.arrowLine then GUI.arrowLine.Visible = false end
+    if GUI.arrowPointer then GUI.arrowPointer.Visible = false end
 end
 
--- === GUI Principal WHXScript ===
-local screenGui = playerGui:FindFirstChild("WHXScript_GUI")
-if not screenGui then
+function GUI.createMainWindow()
+    local screenGui = playerGui:FindFirstChild("WHXScript_GUI")
+    if screenGui then screenGui:Destroy() end
+    
     screenGui = Instance.new("ScreenGui")
     screenGui.Name = "WHXScript_GUI"
     screenGui.ResetOnSpawn = false
+    screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
     screenGui.Parent = playerGui
-end
-
-local window = screenGui:FindFirstChild("Window")
-if not window then
-    window = Instance.new("Frame")
-    window.Name = "Window"
-    window.Size = UDim2.new(0, 280, 0, 130)
-    window.Position = UDim2.new(0, 50, 0, 50)
-    window.BackgroundColor3 = Color3.fromRGB(25, 0, 30) -- fundo roxo escuro gótico
+    
+    -- Janela principal
+    local window = Instance.new("Frame")
+    window.Name = "MainWindow"
+    window.Size = UDim2.new(0, 320, 0, 180)
+    window.Position = UDim2.new(0.5, -160, 0.5, -90)
+    window.BackgroundColor3 = CONFIG.GUI_COLORS.BACKGROUND
     window.BorderSizePixel = 0
-    window.AnchorPoint = Vector2.new(0, 0)
+    window.Visible = false
     window.Parent = screenGui
-
+    
+    -- Cantos arredondados
     local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 14)
+    corner.CornerRadius = UDim.new(0, 12)
     corner.Parent = window
-
+    
+    -- Sombra
     local shadow = Instance.new("ImageLabel")
     shadow.Name = "Shadow"
-    shadow.Size = UDim2.new(1, 14, 1, 14)
-    shadow.Position = UDim2.new(0, -7, 0, -7)
+    shadow.Size = UDim2.new(1, 20, 1, 20)
+    shadow.Position = UDim2.new(0, -10, 0, -10)
     shadow.BackgroundTransparency = 1
     shadow.Image = "rbxassetid://1316045217"
-    shadow.ImageColor3 = Color3.fromRGB(45, 0, 55)
+    shadow.ImageColor3 = Color3.fromRGB(0, 0, 0)
+    shadow.ImageTransparency = 0.5
     shadow.ZIndex = 0
     shadow.Parent = window
-
+    
+    -- Título
     local title = Instance.new("TextLabel")
     title.Name = "Title"
-    title.Size = UDim2.new(1, 0, 0, 28)
+    title.Size = UDim2.new(1, -40, 0, 40)
+    title.Position = UDim2.new(0, 0, 0, 0)
     title.BackgroundTransparency = 1
-    title.Font = Enum.Font.GothamBlack
-    title.Text = "WHXScript - Auto Chess"
-    title.TextColor3 = Color3.fromRGB(160, 32, 240)
-    title.TextSize = 20
+    title.Font = Enum.Font.GothamBold
+    title.Text = "WHXScript - Auto Chess Engine"
+    title.TextColor3 = CONFIG.GUI_COLORS.ACCENT
+    title.TextSize = 18
+    title.TextXAlignment = Enum.TextXAlignment.Center
     title.Parent = window
-
-    local btnClose = Instance.new("TextButton")
-    btnClose.Name = "CloseButton"
-    btnClose.Size = UDim2.new(0, 28, 0, 28)
-    btnClose.Position = UDim2.new(1, -34, 0, 2)
-    btnClose.BackgroundColor3 = Color3.fromRGB(60, 0, 60)
-    btnClose.BorderSizePixel = 0
-    btnClose.Font = Enum.Font.GothamBlack
-    btnClose.Text = "×"
-    btnClose.TextColor3 = Color3.fromRGB(255, 40, 40)
-    btnClose.TextSize = 26
-    btnClose.Parent = window
-
-    btnClose.MouseEnter:Connect(function()
-        btnClose.BackgroundColor3 = Color3.fromRGB(100, 0, 0)
-        btnClose.TextColor3 = Color3.fromRGB(255, 80, 80)
-    end)
-    btnClose.MouseLeave:Connect(function()
-        btnClose.BackgroundColor3 = Color3.fromRGB(60, 0, 60)
-        btnClose.TextColor3 = Color3.fromRGB(255, 40, 40)
-    end)
-
+    
+    -- Botão fechar
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Name = "CloseButton"
+    closeBtn.Size = UDim2.new(0, 30, 0, 30)
+    closeBtn.Position = UDim2.new(1, -35, 0, 5)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(60, 0, 60)
+    closeBtn.BorderSizePixel = 0
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.Text = "×"
+    closeBtn.TextColor3 = CONFIG.GUI_COLORS.ERROR
+    closeBtn.TextSize = 20
+    closeBtn.Parent = window
+    
+    local closeBtnCorner = Instance.new("UICorner")
+    closeBtnCorner.CornerRadius = UDim.new(0, 6)
+    closeBtnCorner.Parent = closeBtn
+    
+    -- Container principal
     local container = Instance.new("Frame")
     container.Name = "Container"
-    container.Size = UDim2.new(1, -16, 1, -40)
-    container.Position = UDim2.new(0, 8, 0, 32)
+    container.Size = UDim2.new(1, -20, 1, -50)
+    container.Position = UDim2.new(0, 10, 0, 40)
     container.BackgroundTransparency = 1
     container.Parent = window
-
-    local btnToggleSunfish = Instance.new("TextButton")
-    btnToggleSunfish.Name = "BtnToggleSunfish"
-    btnToggleSunfish.Size = UDim2.new(1, 0, 0, 40)
-    btnToggleSunfish.Position = UDim2.new(0, 0, 0, 0)
-    btnToggleSunfish.BackgroundColor3 = Color3.fromRGB(120, 0, 40)
-    btnToggleSunfish.BorderSizePixel = 0
-    btnToggleSunfish.Font = Enum.Font.GothamBold
-    btnToggleSunfish.Text = "Ativar Stockfish"
-    btnToggleSunfish.TextColor3 = Color3.fromRGB(255, 80, 80)
-    btnToggleSunfish.TextSize = 20
-    btnToggleSunfish.Parent = container
-
-    btnToggleSunfish.MouseEnter:Connect(function()
-        btnToggleSunfish.BackgroundColor3 = Color3.fromRGB(180, 0, 60)
-        btnToggleSunfish.TextColor3 = Color3.fromRGB(255, 120, 120)
-    end)
-    btnToggleSunfish.MouseLeave:Connect(function()
-        if sunfishEnabled then
-            btnToggleSunfish.BackgroundColor3 = Color3.fromRGB(0, 90, 0)
-            btnToggleSunfish.TextColor3 = Color3.fromRGB(0, 255, 0)
-        else
-            btnToggleSunfish.BackgroundColor3 = Color3.fromRGB(120, 0, 40)
-            btnToggleSunfish.TextColor3 = Color3.fromRGB(255, 80, 80)
-        end
-    end)
-
+    
+    -- Botão toggle
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Name = "ToggleButton"
+    toggleBtn.Size = UDim2.new(1, 0, 0, 45)
+    toggleBtn.Position = UDim2.new(0, 0, 0, 0)
+    toggleBtn.BackgroundColor3 = Color3.fromRGB(120, 0, 40)
+    toggleBtn.BorderSizePixel = 0
+    toggleBtn.Font = Enum.Font.GothamBold
+    toggleBtn.Text = "🚀 Ativar Stockfish Engine"
+    toggleBtn.TextColor3 = CONFIG.GUI_COLORS.TEXT
+    toggleBtn.TextSize = 16
+    toggleBtn.Parent = container
+    
+    local toggleBtnCorner = Instance.new("UICorner")
+    toggleBtnCorner.CornerRadius = UDim.new(0, 8)
+    toggleBtnCorner.Parent = toggleBtn
+    
+    -- Status label
     local statusLabel = Instance.new("TextLabel")
     statusLabel.Name = "StatusLabel"
-    statusLabel.Size = UDim2.new(1, 0, 0, 24)
-    statusLabel.Position = UDim2.new(0, 0, 0, 48)
+    statusLabel.Size = UDim2.new(1, 0, 0, 30)
+    statusLabel.Position = UDim2.new(0, 0, 0, 55)
     statusLabel.BackgroundTransparency = 1
     statusLabel.Font = Enum.Font.Gotham
-    statusLabel.Text = "Status: Desativado"
+    statusLabel.Text = "Status: Engine desativado"
     statusLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
-    statusLabel.TextSize = 16
+    statusLabel.TextSize = 14
     statusLabel.TextWrapped = true
     statusLabel.Parent = container
-
-    -- Guardar referências para usar fora
-    window.BtnToggleSunfish = btnToggleSunfish
-    window.StatusLabel = statusLabel
+    
+    -- Info label
+    local infoLabel = Instance.new("TextLabel")
+    infoLabel.Name = "InfoLabel"
+    infoLabel.Size = UDim2.new(1, 0, 0, 40)
+    infoLabel.Position = UDim2.new(0, 0, 0, 85)
+    infoLabel.BackgroundTransparency = 1
+    infoLabel.Font = Enum.Font.Gotham
+    infoLabel.Text = "Depth: " .. CONFIG.STOCKFISH_DEPTH .. " | Erros: 0/" .. ScriptState.maxErrors
+    infoLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+    infoLabel.TextSize = 12
+    infoLabel.TextWrapped = true
+    infoLabel.Parent = container
+    
+    GUI.window = window
+    GUI.toggleBtn = toggleBtn
+    GUI.statusLabel = statusLabel
+    GUI.infoLabel = infoLabel
+    GUI.closeBtn = closeBtn
 end
 
--- Barra minimizada arrastável com estilo gótico
-local miniBar = screenGui:FindFirstChild("MiniBar")
-if not miniBar then
-    miniBar = Instance.new("TextButton")
+function GUI.createMiniBar()
+    local miniBar = Instance.new("TextButton")
     miniBar.Name = "MiniBar"
-    miniBar.Size = UDim2.new(0, 60, 0, 32)
+    miniBar.Size = UDim2.new(0, 80, 0, 35)
     miniBar.Position = UDim2.new(0, 20, 0, 20)
-    miniBar.BackgroundColor3 = Color3.fromRGB(15, 0, 15)
+    miniBar.BackgroundColor3 = CONFIG.GUI_COLORS.BACKGROUND
     miniBar.BorderSizePixel = 0
-    miniBar.Text = "WHX"
-    miniBar.TextColor3 = Color3.fromRGB(255, 50, 50)
+    miniBar.Text = "WHX ♛"
+    miniBar.TextColor3 = CONFIG.GUI_COLORS.ACCENT
     miniBar.Font = Enum.Font.GothamBold
-    miniBar.TextSize = 20
+    miniBar.TextSize = 16
     miniBar.Visible = true
-    miniBar.Parent = screenGui
-
+    miniBar.Parent = playerGui:FindFirstChild("WHXScript_GUI")
+    
     local miniCorner = Instance.new("UICorner")
-    miniCorner.CornerRadius = UDim.new(0, 10)
+    miniCorner.CornerRadius = UDim.new(0, 8)
     miniCorner.Parent = miniBar
+    
+    GUI.miniBar = miniBar
+end
 
-    -- Arrastar miniBar
-    local draggingMini = false
-    local dragStartMini = nil
-    local startPosMini = nil
-
-    miniBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            draggingMini = true
-            dragStartMini = input.Position
-            startPosMini = miniBar.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    draggingMini = false
-                end
-            end)
+function GUI.setupEventHandlers()
+    -- Toggle button
+    GUI.toggleBtn.MouseButton1Click:Connect(function()
+        ScriptState.enabled = not ScriptState.enabled
+        GUI.updateToggleButton()
+        
+        if not ScriptState.enabled then
+            GUI.clearArrow()
         end
     end)
-
-    miniBar.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement and draggingMini then
-            local delta = input.Position - dragStartMini
-            local newX = math.clamp(startPosMini.X.Offset + delta.X, 0, workspace.CurrentCamera.ViewportSize.X - miniBar.AbsoluteSize.X)
-            local newY = math.clamp(startPosMini.Y.Offset + delta.Y, 0, workspace.CurrentCamera.ViewportSize.Y - miniBar.AbsoluteSize.Y)
-            miniBar.Position = UDim2.new(0, newX, 0, newY)
-        end
+    
+    -- Close button
+    GUI.closeBtn.MouseButton1Click:Connect(function()
+        GUI.window.Visible = false
+        GUI.miniBar.Visible = true
     end)
-
-    miniBar.MouseButton1Click:Connect(function()
-        miniBar.Visible = false
-        window.Visible = true
+    
+    -- Mini bar click
+    GUI.miniBar.MouseButton1Click:Connect(function()
+        GUI.miniBar.Visible = false
+        GUI.window.Visible = true
+    end)
+    
+    -- Hover effects
+    GUI.toggleBtn.MouseEnter:Connect(function()
+        Utils.createTween(GUI.toggleBtn, TweenInfo.new(0.2), {
+            BackgroundColor3 = ScriptState.enabled and Color3.fromRGB(0, 120, 0) or Color3.fromRGB(180, 0, 60)
+        })
+    end)
+    
+    GUI.toggleBtn.MouseLeave:Connect(function()
+        Utils.createTween(GUI.toggleBtn, TweenInfo.new(0.2), {
+            BackgroundColor3 = ScriptState.enabled and Color3.fromRGB(0, 90, 0) or Color3.fromRGB(120, 0, 40)
+        })
     end)
 end
 
--- Tornar janela principal arrastável
-local draggingWindow = false
-local dragStartWindow = nil
-local startPosWindow = nil
-
-window.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        draggingWindow = true
-        dragStartWindow = input.Position
-        startPosWindow = window.Position
-        input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
-                draggingWindow = false
-            end
-        end)
-    end
-end)
-
-window.InputChanged:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseMovement and draggingWindow then
-        local delta = input.Position - dragStartWindow
-        local newX = math.clamp(startPosWindow.X.Offset + delta.X, 0, workspace.CurrentCamera.ViewportSize.X - window.AbsoluteSize.X)
-        local newY = math.clamp(startPosWindow.Y.Offset + delta.Y, 0, workspace.CurrentCamera.ViewportSize.Y - window.AbsoluteSize.Y)
-        window.Position = UDim2.new(0, newX, 0, newY)
-    end
-end)
-
-window.Visible = false
-miniBar.Visible = true
-
--- Botão toggle Stockfish
-window.BtnToggleSunfish.MouseButton1Click:Connect(function()
-    sunfishEnabled = not sunfishEnabled
-    if sunfishEnabled then
-        window.BtnToggleSunfish.BackgroundColor3 = Color3.fromRGB(0, 90, 0)
-        window.BtnToggleSunfish.Text = "Desativar Stockfish"
-        window.BtnToggleSunfish.TextColor3 = Color3.fromRGB(0, 255, 0)
-        window.StatusLabel.Text = "Status: Stockfish ativado, sugerindo movimentos..."
-window.StatusLabel.TextColor3 = Color3.fromRGB(0, 255, 0)
+function GUI.updateToggleButton()
+    if ScriptState.enabled then
+        GUI.toggleBtn.BackgroundColor3 = Color3.fromRGB(0, 90, 0)
+        GUI.toggleBtn.Text = "⏹️ Desativar Stockfish Engine"
+        GUI.toggleBtn.TextColor3 = CONFIG.GUI_COLORS.SUCCESS
+        GUI.statusLabel.Text = "Status: Engine ativo, analisando posições..."
+        GUI.statusLabel.TextColor3 = CONFIG.GUI_COLORS.SUCCESS
     else
-        window.BtnToggleSunfish.BackgroundColor3 = Color3.fromRGB(120, 0, 40)
-        window.BtnToggleSunfish.Text = "Ativar Stockfish"
-        window.BtnToggleSunfish.TextColor3 = Color3.fromRGB(255, 80, 80)
-        window.StatusLabel.Text = "Status: Desativado"
-        window.StatusLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
-        clearArrow()
+        GUI.toggleBtn.BackgroundColor3 = Color3.fromRGB(120, 0, 40)
+        GUI.toggleBtn.Text = "🚀 Ativar Stockfish Engine"
+        GUI.toggleBtn.TextColor3 = CONFIG.GUI_COLORS.TEXT
+        GUI.statusLabel.Text = "Status: Engine desativado"
+        GUI.statusLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
     end
-end)
+end
 
--- Botão fechar janela principal
-window.CloseButton.MouseButton1Click:Connect(function()
-    window.Visible = false
-    miniBar.Visible = true
-end)
+function GUI.updateInfo()
+    if GUI.infoLabel then
+        GUI.infoLabel.Text = string.format("Depth: %d | Erros: %d/%d | FPS: %.1f", 
+            CONFIG.STOCKFISH_DEPTH, 
+            ScriptState.errorCount, 
+            ScriptState.maxErrors,
+            1/RunService.Heartbeat:Wait()
+        )
+    end
+end
 
--- Loop para checar e sugerir movimentos quando ativo
-RunService.Heartbeat:Connect(function()
-    if sunfishEnabled and not checkingMove then
-        checkingMove = true
-        local fen = getFEN()
-        if fen and fen ~= lastFEN then
-            lastFEN = fen
-            local fromSquare, toSquare = getBestMoveStockfish(fen)
-            if fromSquare and toSquare then
-                lastMove = {from = fromSquare, to = toSquare}
-                updateArrow(fromSquare, toSquare)
-            else
-                clearArrow()
+-- ===== MÓDULO PRINCIPAL =====
+local Main = {}
+
+function Main.init()
+    print("[WHXScript] Inicializando Auto Chess Engine...")
+    
+    GUI.init()
+    Main.setupMainLoop()
+    
+    print("[WHXScript] Engine inicializado com sucesso!")
+end
+
+function Main.setupMainLoop()
+    RunService.Heartbeat:Connect(function()
+        local currentTime = tick()
+        
+        -- Atualizar info da GUI
+        GUI.updateInfo()
+        
+        -- Verificar se deve parar por muitos erros
+        if ScriptState.errorCount >= ScriptState.maxErrors then
+            if ScriptState.enabled then
+                ScriptState.enabled = false
+                GUI.updateToggleButton()
+                GUI.statusLabel.Text = "Status: Desativado por muitos erros"
+                GUI.statusLabel.TextColor3 = CONFIG.GUI_COLORS.ERROR
             end
-        elseif not fen then
-            clearArrow()
+            return
         end
-        checkingMove = false
+        
+        -- Executar lógica principal apenas se ativo e no intervalo correto
+        if ScriptState.enabled and not ScriptState.checking and 
+           (currentTime - ScriptState.lastUpdateTime) >= CONFIG.UPDATE_INTERVAL then
+            
+            Main.processChessPosition()
+            ScriptState.lastUpdateTime = currentTime
+        end
+    end)
+end
+
+function Main.processChessPosition()
+    ScriptState.checking = true
+    
+    local fen = ChessEngine.getFEN()
+    
+    if not fen then
+        GUI.clearArrow()
+        ScriptState.checking = false
+        return
+    end
+    
+    -- Só processar se a posição mudou
+    if fen ~= ScriptState.lastFEN then
+        ScriptState.lastFEN = fen
+        
+        local moveData = ChessEngine.getBestMove(fen)
+        
+        if moveData then
+            ScriptState.lastMove = moveData
+            GUI.updateArrow(moveData)
+            
+            -- Reset error count on success
+            if ScriptState.errorCount > 0 then
+                ScriptState.errorCount = math.max(0, ScriptState.errorCount - 1)
+            end
+        else
+            GUI.clearArrow()
+        end
+    end
+    
+    ScriptState.checking = false
+end
+
+-- ===== INICIALIZAÇÃO =====
+Main.init()
+
+-- ===== CLEANUP =====
+game.Players.PlayerRemoving:Connect(function(plr)
+    if plr == player then
+        GUI.clearArrow()
     end
 end)
